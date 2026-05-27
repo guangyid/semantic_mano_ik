@@ -37,11 +37,9 @@ python -u methods/mano_fitting/fit_from_points.py --input-path samples/ring_join
 ```bash
 python -u methods/single_ik/visualize.py ring-joint --sample-path samples/ring_joint_demo.npy --mano-path /path/to/mano
 ```
-`assets/sequence_mano.npz` is a MANO motion asset, and `assets/sequence_visualization.mp4` is its rendered visualization produced from that sequence.
+`assets/sequence_mano.npz` is a MANO motion asset, and `assets/sequence_visualization.gif` is its inline preview rendered from that sequence.
 
-<video controls muted loop playsinline style="width: 100%; max-width: 100%;">
-  <source src="assets/sequence_visualization.mp4" type="video/mp4">
-</video>
+![sequence_visualization](assets/sequence_visualization.gif)
 
 - method comparison: compare `single_ik`, `mano_fitting`, and `refine_ik` on the same payload. 
 ```bash
