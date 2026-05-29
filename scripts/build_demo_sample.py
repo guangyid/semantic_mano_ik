@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the local demo sample used for ring/joint visualization and quick tests."""
+"""Build the local demo sample from a frame of the bundled MANO sequence asset."""
 from __future__ import annotations
 
 import argparse
@@ -15,53 +15,58 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utils.mano.approx import ApproxForwardManoEstimator
 from utils.mano.mano_load import createManoLayer, resolveManoPath
+from utils.mano.payload import load_payload_file
 from utils.mano.reorder import resolveApproxIkInputOrders
 
 
-FINGER_SLICES = {
-    "index": slice(0, 3),
-    "middle": slice(3, 6),
-    "pinky": slice(6, 9),
-    "ring": slice(9, 12),
-    "thumb": slice(12, 15),
-}
+def _unwrap_object_scalar(value):
+    if isinstance(value, np.ndarray) and value.shape == () and value.dtype == object:
+        return value.item()
+    return value
 
 
-def _set_finger_axis(hand_pose: np.ndarray, finger_name: str, axis: int, values: list[float]) -> None:
-    hand_pose[FINGER_SLICES[finger_name], axis] = np.asarray(values, dtype=np.float32)
+def _resolve_frame_index(frame_index: int, frame_count: int) -> int:
+    resolved = frame_index if frame_index >= 0 else frame_count + frame_index
+    if resolved < 0 or resolved >= frame_count:
+        raise IndexError(f"frame_index={frame_index} is out of range for frame_count={frame_count}")
+    return resolved
 
 
-def _set_finger_curl(hand_pose: np.ndarray, finger_name: str, values: list[float]) -> None:
-    _set_finger_axis(hand_pose, finger_name, 0, values)
+def _load_demo_hand_params(
+    *,
+    sequence_path: Path,
+    sample_key: str,
+    frame_index: int,
+    hand_side: str,
+) -> tuple[dict[str, np.ndarray], int]:
+    payload = load_payload_file(sequence_path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{sequence_path} must contain a dict-like sequence payload")
+    if sample_key not in payload:
+        raise KeyError(f"{sequence_path} does not contain sample_key={sample_key}; available keys: {sorted(payload.keys())}")
+    entry = _unwrap_object_scalar(payload[sample_key])
+    if not isinstance(entry, dict):
+        raise ValueError(f"{sequence_path}:{sample_key} is not a dict payload")
 
+    prefix = "left" if hand_side == "left" else "right"
+    pose = np.asarray(entry[f"{prefix}_pose"], dtype=np.float32)
+    transl = np.asarray(entry[f"{prefix}_trans"], dtype=np.float32)
+    shape = np.asarray(entry[f"{prefix}_shape"], dtype=np.float32)
+    if pose.ndim != 2 or pose.shape[1] != 48:
+        raise ValueError(f"{prefix}_pose must have shape [T,48], got {pose.shape}")
+    if transl.shape != (pose.shape[0], 3):
+        raise ValueError(f"{prefix}_trans must have shape [T,3], got {transl.shape}")
+    if shape.shape != (pose.shape[0], 10):
+        raise ValueError(f"{prefix}_shape must have shape [T,10], got {shape.shape}")
 
-def _build_demo_hand_params(hand_side: str) -> dict[str, np.ndarray]:
-    pose = np.zeros((15, 3), dtype=np.float32)
-    if hand_side == "left":
-        _set_finger_curl(pose, "index", [0.10, 0.14, 0.08])
-        for finger_name in ("middle", "ring", "pinky"):
-            _set_finger_curl(pose, finger_name, [1.00, 1.28, 1.06])
-        _set_finger_curl(pose, "thumb", [0.36, 0.54, 0.44])
-        _set_finger_axis(pose, "thumb", 1, [-0.24, -0.18, -0.12])
-        root_rot = np.array([0.08, -0.10, 0.18], dtype=np.float32)
-        transl = np.array([-0.055, 0.012, 0.000], dtype=np.float32)
-    else:
-        for finger_name in ("index", "middle", "ring", "pinky"):
-            _set_finger_curl(pose, finger_name, [0.58, 0.92, 0.76])
-        _set_finger_curl(pose, "thumb", [0.30, 0.48, 0.38])
-        _set_finger_axis(pose, "index", 1, [0.42, 0.16, 0.08])
-        _set_finger_axis(pose, "middle", 1, [0.05, 0.02, 0.00])
-        _set_finger_axis(pose, "ring", 1, [-0.24, -0.10, -0.04])
-        _set_finger_axis(pose, "pinky", 1, [-0.46, -0.18, -0.08])
-        _set_finger_axis(pose, "thumb", 1, [0.26, 0.14, 0.08])
-        root_rot = np.array([0.10, 0.04, -0.08], dtype=np.float32)
-        transl = np.array([0.055, -0.010, 0.004], dtype=np.float32)
+    resolved_frame = _resolve_frame_index(frame_index=frame_index, frame_count=int(pose.shape[0]))
+    pose_frame = pose[resolved_frame]
     return {
-        "root_rot": root_rot,
-        "hand_pose": pose.reshape(-1),
-        "transl": transl,
-        "shape": np.zeros((10,), dtype=np.float32),
-    }
+        "root_rot": pose_frame[:3].astype(np.float32),
+        "hand_pose": pose_frame[3:].astype(np.float32),
+        "transl": transl[resolved_frame].astype(np.float32),
+        "shape": shape[resolved_frame].astype(np.float32),
+    }, resolved_frame
 
 
 def _decode_vertices(
@@ -96,16 +101,20 @@ def _pack_full_mano(mano_params: dict[str, np.ndarray]) -> np.ndarray:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build the local ring/joint demo sample")
+    parser = argparse.ArgumentParser(description="Build the local ring/joint demo sample from sequence_mano")
     parser.add_argument("--mano-path", type=str, default=None)
     parser.add_argument("--sample-index-path", type=str, default="assets/part_ik_hand_index_100.npy")
     parser.add_argument("--axis-prior-path", type=str, default="assets/mano_flat_hand_axis_prior.npy")
-    parser.add_argument("--output-path", type=str, default="samples/ring_joint_demo.npy")
+    parser.add_argument("--sequence-path", type=str, default="assets/sequence_mano.npz")
+    parser.add_argument("--sample-key", type=str, default="0")
+    parser.add_argument("--frame-index", type=int, default=-1, help="Frame index inside the chosen sequence sample; -1 means the last frame")
+    parser.add_argument("--output-path", type=str, default="outputs/ring_joint_demo.npy")
     args = parser.parse_args()
 
     mano_path = resolveManoPath(manoPath=args.mano_path, projectRoot=PROJECT_ROOT)
     sample_index_path = Path(args.sample_index_path)
     axis_prior_path = Path(args.axis_prior_path)
+    sequence_path = Path(args.sequence_path)
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -116,8 +125,18 @@ def main() -> None:
         for param in mano_layer[side].parameters():
             param.requires_grad_(False)
 
-    left_gt = _build_demo_hand_params("left")
-    right_gt = _build_demo_hand_params("right")
+    left_gt, resolved_frame = _load_demo_hand_params(
+        sequence_path=sequence_path,
+        sample_key=str(args.sample_key),
+        frame_index=int(args.frame_index),
+        hand_side="left",
+    )
+    right_gt, _ = _load_demo_hand_params(
+        sequence_path=sequence_path,
+        sample_key=str(args.sample_key),
+        frame_index=int(args.frame_index),
+        hand_side="right",
+    )
     left_verts = _decode_vertices(mano_layer=mano_layer, hand_side="left", mano_params=left_gt)
     right_verts = _decode_vertices(mano_layer=mano_layer, hand_side="right", mano_params=right_gt)
     left_points = left_verts[sample_index_order]
@@ -153,9 +172,12 @@ def main() -> None:
 
     payload = {
         "format_version": 1,
-        "sample_name": "ring_joint_demo",
+        "sample_name": f"sequence_mano_sample_{args.sample_key}_frame_{resolved_frame:03d}",
         "sample_index_order": sample_index_order,
         "sample_index_source_hand": source_hand_side,
+        "source_sequence_path": str(sequence_path),
+        "source_sequence_key": str(args.sample_key),
+        "source_frame_index": int(resolved_frame),
         "left_points_world": left_points.astype(np.float32),
         "right_points_world": right_points.astype(np.float32),
         "single_ik_mano_params": single_ik_full.reshape(1, 1, 122),

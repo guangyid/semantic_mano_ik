@@ -1,4 +1,4 @@
-"""Small trimesh visualization helpers reused across scripts."""
+"""Small visualization helpers reused across scripts."""
 from __future__ import annotations
 
 import math
@@ -88,3 +88,84 @@ def build_hand_mesh(verts: np.ndarray, faces: np.ndarray, *, color: np.ndarray) 
     mesh = trimesh.Trimesh(vertices=verts.astype(np.float32), faces=faces.astype(np.int64), process=False)
     mesh.visual.vertex_colors = np.tile(np.asarray(color, dtype=np.uint8)[None, :], (mesh.vertices.shape[0], 1))
     return mesh
+
+
+def set_axes_equal(ax, points: np.ndarray, *, zoom: float = 1.0) -> None:
+    mins = points.min(axis=0)
+    maxs = points.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = 0.52 * float(np.max(maxs - mins))
+    radius = max(radius * float(zoom), 0.022)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+
+
+def style_3d_axes(ax, title: str | None = None) -> None:
+    if title:
+        ax.set_title(title, pad=8)
+    ax.set_box_aspect((1, 1, 1))
+    ax.grid(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_zlabel("")
+    ax.xaxis.pane.set_alpha(0.0)
+    ax.yaxis.pane.set_alpha(0.0)
+    ax.zaxis.pane.set_alpha(0.0)
+    try:
+        ax.xaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+        ax.yaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+        ax.zaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+    except Exception:
+        pass
+
+
+def plot_mesh(ax, verts: np.ndarray, faces: np.ndarray, *, color: str, alpha: float) -> None:
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    tris = verts[faces]
+    poly = Poly3DCollection(tris, facecolor=color, edgecolor="none", alpha=alpha)
+    ax.add_collection3d(poly)
+
+
+def plot_trimesh(ax, mesh: trimesh.Trimesh, *, color: str, alpha: float) -> None:
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    tris = np.asarray(mesh.vertices)[np.asarray(mesh.faces)]
+    poly = Poly3DCollection(tris, facecolor=color, edgecolor="none", alpha=alpha)
+    ax.add_collection3d(poly)
+
+
+def plot_round_arrow(
+    ax,
+    *,
+    origin: np.ndarray,
+    direction: np.ndarray,
+    length: float,
+    radius: float,
+    color: str,
+    alpha: float = 0.96,
+    arrow_ratio: float = 0.24,
+) -> None:
+    origin = np.asarray(origin, dtype=np.float32)
+    unit = np.asarray(direction, dtype=np.float32)
+    unit_norm = float(np.linalg.norm(unit))
+    if unit_norm < 1.0e-8 or length <= 0.0:
+        return
+    unit = unit / unit_norm
+    tip_length = max(length * float(arrow_ratio), radius * 6.0)
+    tip_length = min(tip_length, length * 0.45)
+    shaft_length = max(length - tip_length, length * 0.55)
+
+    shaft = trimesh.creation.cylinder(radius=float(radius), height=float(shaft_length), sections=32)
+    shaft.apply_transform(_rotation_from_z(unit * shaft_length))
+    shaft.apply_translation(origin + unit * (0.5 * shaft_length))
+    plot_trimesh(ax, shaft, color=color, alpha=alpha)
+
+    cone = trimesh.creation.cone(radius=float(radius * 2.15), height=float(tip_length), sections=32)
+    cone.apply_transform(_rotation_from_z(unit * tip_length))
+    cone.apply_translation(origin + unit * (shaft_length - radius * 0.12))
+    plot_trimesh(ax, cone, color=color, alpha=alpha)

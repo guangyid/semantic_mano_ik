@@ -8,18 +8,16 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import torch
-from collections import OrderedDict
 import trimesh
-from trimesh.transformations import rotation_matrix
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 projectRootStr = str(PROJECT_ROOT)
@@ -28,9 +26,20 @@ if projectRootStr in sys.path:
 sys.path.insert(0, projectRootStr)
 
 from utils.mano.approx import ApproxForwardManoEstimator
-from utils.mano.payload import invert_permutation, load_payload_file, resolve_input_reorder
-from utils.mano.helpers import build_root_points, build_wrist_frame, decode_single_hand_mano
+from utils.mano.payload import build_mano_sequence, invert_permutation, load_sequence_entry, resolve_input_reorder
+from utils.mano.helpers import (
+    FINGER_NAMES,
+    build_joint_centers,
+    build_ring_points,
+    build_root_points,
+    build_segment_axes,
+    build_wrist_frame,
+    decode_single_hand_mano,
+    joint_name_to_finger,
+    segment_name_to_finger,
+)
 from utils.mano.mano_load import createManoLayer, resolveManoPath
+from utils.vis.trimesh_vis import plot_mesh, plot_round_arrow, set_axes_equal, style_3d_axes
 
 
 GT_MESH_COLOR = "#d9b89c"
@@ -59,20 +68,20 @@ ROOT_AXIS_TIP_SIZE = 34
 ROOT_AXIS_ORIGIN_SIZE = 26
 ROOT_AXIS_ARROW_RATIO = 0.24
 ROOT_AXIS_RADIUS = 0.0023
-FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
-JOINT_LEVELS = ["joint_1", "joint_2", "joint_3", "tip"]
-FINGER_JOINT_GROUPS = OrderedDict([
-    ("thumb", (13, 14, 15)),
-    ("index", (1, 2, 3)),
-    ("middle", (4, 5, 6)),
-    ("ring", (10, 11, 12)),
-    ("pinky", (7, 8, 9)),
-])
+METRIC_TEXT_FONTSIZE = 17
+BIMANUAL_TITLE_FONTSIZE = 18
+BIMANUAL_FIGSIZE = (22.6, 5.55)
+BIMANUAL_LEFT = 0.004
+BIMANUAL_RIGHT = 0.996
+BIMANUAL_TOP = 0.94
+BIMANUAL_BOTTOM = 0.10
+BIMANUAL_WSPACE = 0.002
+BIMANUAL_METRIC_Y = 0.026
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize MANO sample sequence with 100 semantic points and IK")
-    parser.add_argument("--mano-dataset-path", type=str, default="sample_dataset/test_mano.npz")
+    parser.add_argument("--mano-dataset-path", type=str, default="assets/sequence_mano.npz")
     parser.add_argument("--sample-key", type=str, default=None, help="Sample key; if empty, use --sample-index instead")
     parser.add_argument("--sample-index", type=int, default=0, help="Sample index used when --sample-key is empty")
     parser.add_argument("--hand-side", type=str, default="both", choices=["left", "right", "both"])
@@ -86,96 +95,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-video", action="store_true")
     parser.add_argument("--elev", type=float, default=-12.0)
     parser.add_argument("--azim", type=float, default=-96.0)
-    parser.add_argument("--zoom", type=float, default=0.72, help="Values below 1 move the camera closer")
+    parser.add_argument("--zoom", type=float, default=0.62, help="Values below 1 move the camera closer")
     return parser.parse_args()
-
-
-def _sorted_sample_keys(payload: dict[str, Any]) -> list[str]:
-    def _sort_key(text: str) -> tuple[int, str]:
-        return (0, f"{int(text):08d}") if text.isdigit() else (1, text)
-
-    return sorted(payload.keys(), key=_sort_key)
-
-
-def _unwrap_object_scalar(value: Any) -> Any:
-    if isinstance(value, np.ndarray) and value.shape == () and value.dtype == object:
-        return value.item()
-    return value
-
-
-def _load_sequence_entry(datasetPath: Path, sampleKey: str | None, sampleIndex: int) -> tuple[str, dict[str, Any], list[str]]:
-    payload = load_payload_file(datasetPath)
-    if not isinstance(payload, dict):
-        raise ValueError(f"{datasetPath} must be an npz or dict containing multiple samples")
-    keys = _sorted_sample_keys(payload)
-    if not keys:
-        raise ValueError(f"{datasetPath} does not contain any samples")
-    resolvedKey = sampleKey if sampleKey is not None else keys[sampleIndex]
-    if resolvedKey not in payload:
-        raise KeyError(f"{datasetPath} does not contain sample key={resolvedKey}; available keys: {keys}")
-    entry = _unwrap_object_scalar(payload[resolvedKey])
-    if not isinstance(entry, dict):
-        raise ValueError(f"{datasetPath}:{resolvedKey} is not a dict payload")
-    return resolvedKey, entry, keys
-
-
-def _build_mano_sequence(entry: dict[str, Any], handSide: str) -> np.ndarray:
-    prefix = "left" if handSide == "left" else "right"
-    pose = np.asarray(entry[f"{prefix}_pose"], dtype=np.float32)
-    transl = np.asarray(entry[f"{prefix}_trans"], dtype=np.float32)
-    shape = np.asarray(entry[f"{prefix}_shape"], dtype=np.float32)
-    if pose.ndim != 2 or pose.shape[1] != 48:
-        raise ValueError(f"{prefix}_pose must have shape [T,48], got {pose.shape}")
-    if transl.shape != (pose.shape[0], 3):
-        raise ValueError(f"{prefix}_trans must have shape [T,3], got {transl.shape}")
-    if shape.shape != (pose.shape[0], 10):
-        raise ValueError(f"{prefix}_shape must have shape [T,10], got {shape.shape}")
-    return np.concatenate([pose, transl, shape], axis=1).astype(np.float32)
-
-
-def _set_axes_equal(ax, points: np.ndarray, *, zoom: float = 1.0) -> None:
-    mins = points.min(axis=0)
-    maxs = points.max(axis=0)
-    center = 0.5 * (mins + maxs)
-    radius = 0.52 * float(np.max(maxs - mins))
-    radius = max(radius * float(zoom), 0.022)
-    ax.set_xlim(center[0] - radius, center[0] + radius)
-    ax.set_ylim(center[1] - radius, center[1] + radius)
-    ax.set_zlim(center[2] - radius, center[2] + radius)
-
-
-def _style_ax(ax, title: str) -> None:
-    ax.set_title(title, fontsize=11)
-    ax.set_box_aspect((1, 1, 1))
-    ax.grid(False)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_zticks([])
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    ax.set_zlabel("")
-    ax.xaxis.pane.set_alpha(0.0)
-    ax.yaxis.pane.set_alpha(0.0)
-    ax.zaxis.pane.set_alpha(0.0)
-    try:
-        ax.xaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
-        ax.yaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
-        ax.zaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
-    except Exception:
-        pass
-
-
-def _plot_mesh(ax, verts: np.ndarray, faces: np.ndarray, *, color: str, alpha: float) -> None:
-    tris = verts[faces]
-    poly = Poly3DCollection(tris, facecolor=color, edgecolor="none", alpha=alpha)
-    ax.add_collection3d(poly)
-
-
-def _plot_trimesh(ax, mesh: trimesh.Trimesh, *, color: str, alpha: float) -> None:
-    tris = np.asarray(mesh.vertices)[np.asarray(mesh.faces)]
-    poly = Poly3DCollection(tris, facecolor=color, edgecolor="none", alpha=alpha)
-    ax.add_collection3d(poly)
-
 
 def _build_metric_caption(frameMetrics: list[dict[str, float]], frameIdx: int) -> str:
     metric = frameMetrics[frameIdx]
@@ -193,145 +114,9 @@ def _build_palette(count: int, hue_offset: float) -> list[np.ndarray]:
     return colors
 
 
-def _rotation_from_z(axis: np.ndarray) -> np.ndarray:
-    zAxis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    axis = np.asarray(axis, dtype=np.float32)
-    axisNorm = float(np.linalg.norm(axis))
-    if axisNorm < 1.0e-8:
-        return np.eye(4, dtype=np.float32)
-    unit = axis / axisNorm
-    dotVal = float(np.clip(np.dot(zAxis, unit), -1.0, 1.0))
-    if np.isclose(dotVal, 1.0):
-        return np.eye(4, dtype=np.float32)
-    if np.isclose(dotVal, -1.0):
-        return rotation_matrix(np.pi, [1.0, 0.0, 0.0]).astype(np.float32)
-    rotAxis = np.cross(zAxis, unit)
-    angle = float(np.arccos(dotVal))
-    return rotation_matrix(angle, rotAxis).astype(np.float32)
-
-
-def _plot_round_arrow(
-    ax,
-    *,
-    origin: np.ndarray,
-    direction: np.ndarray,
-    length: float,
-    radius: float,
-    color: str,
-    alpha: float = 0.96,
-) -> None:
-    origin = np.asarray(origin, dtype=np.float32)
-    unit = np.asarray(direction, dtype=np.float32)
-    unitNorm = float(np.linalg.norm(unit))
-    if unitNorm < 1.0e-8 or length <= 0.0:
-        return
-    unit = unit / unitNorm
-    tipLength = max(length * ROOT_AXIS_ARROW_RATIO, radius * 6.0)
-    tipLength = min(tipLength, length * 0.45)
-    shaftLength = max(length - tipLength, length * 0.55)
-
-    shaft = trimesh.creation.cylinder(radius=float(radius), height=float(shaftLength), sections=32)
-    shaft.apply_transform(_rotation_from_z(unit * shaftLength))
-    shaft.apply_translation(origin + unit * (0.5 * shaftLength))
-    _plot_trimesh(ax, shaft, color=color, alpha=alpha)
-
-    cone = trimesh.creation.cone(radius=float(radius * 2.15), height=float(tipLength), sections=32)
-    cone.apply_transform(_rotation_from_z(unit * tipLength))
-    # `trimesh.creation.cone` spans z in [0, height], so place its base directly on the shaft tip.
-    cone.apply_translation(origin + unit * (shaftLength - radius * 0.12))
-    _plot_trimesh(ax, cone, color=color, alpha=alpha)
-
-
 def _build_finger_palette(hue_offset: float) -> dict[str, np.ndarray]:
     colors = _build_palette(len(FINGER_NAMES), hue_offset)
     return {finger: colors[idx] for idx, finger in enumerate(FINGER_NAMES)}
-
-
-def _normalize(vec: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
-    return vec / vec.norm(dim=-1, keepdim=True).clamp(min=eps)
-
-
-def _build_mesh_fingertips(*, verts: torch.Tensor, joints: torch.Tensor) -> torch.Tensor:
-    distal_indices = [group[-1] for group in FINGER_JOINT_GROUPS.values()]
-    proximal_indices = [group[-2] for group in FINGER_JOINT_GROUPS.values()]
-    distal = joints[distal_indices]
-    proximal = joints[proximal_indices]
-    directions = _normalize(distal - proximal)
-    dist = torch.cdist(verts.unsqueeze(0), distal.unsqueeze(0)).squeeze(0)
-    assignment = torch.argmin(dist, dim=-1)
-    tips: list[torch.Tensor] = []
-    for finger_idx in range(len(distal_indices)):
-        mask = assignment == finger_idx
-        if not bool(mask.any().item()):
-            tips.append(distal[finger_idx])
-            continue
-        rel = verts[mask] - distal[finger_idx]
-        proj = (rel * directions[finger_idx]).sum(dim=-1)
-        dist_norm = rel.norm(dim=-1)
-        score = proj - 0.2 * dist_norm
-        tips.append(verts[mask][torch.argmax(score)])
-    return torch.stack(tips, dim=0)
-
-
-def _build_joint_centers(*, template, pointsOrdered: np.ndarray) -> dict[str, np.ndarray]:
-    indexToOffset = {int(index): offset for offset, index in enumerate(template.indexOrder)}
-    centers: dict[str, np.ndarray] = {}
-    for finger in FINGER_NAMES:
-        for level in JOINT_LEVELS:
-            pairName = f"{finger}_{level}"
-            pair = template.jointPairMap[pairName]
-            pos = pointsOrdered[indexToOffset[int(pair["pos"])]]
-            neg = pointsOrdered[indexToOffset[int(pair["neg"])]]
-            centers[pairName] = 0.5 * (pos + neg)
-    return centers
-
-
-def _build_mesh_joint_centers(*, meshJoints: np.ndarray, meshTips: np.ndarray) -> dict[str, np.ndarray]:
-    centers: dict[str, np.ndarray] = {}
-    for fingerName, jointIds in FINGER_JOINT_GROUPS.items():
-        for idx, jointId in enumerate(jointIds):
-            centers[f"{fingerName}_joint_{idx + 1}"] = meshJoints[jointId]
-        centers[f"{fingerName}_tip"] = meshTips[FINGER_NAMES.index(fingerName)]
-    return centers
-
-
-def _build_ring_points(*, template, pointsOrdered: np.ndarray) -> dict[str, np.ndarray]:
-    indexToOffset = {int(index): offset for offset, index in enumerate(template.indexOrder)}
-    ringPoints: dict[str, np.ndarray] = {}
-    for segmentName, ringMap in template.segmentRingMap.items():
-        ringPoints[segmentName] = np.stack(
-            [
-                pointsOrdered[indexToOffset[int(ringMap["mid"])]],
-                pointsOrdered[indexToOffset[int(ringMap["pos"])]],
-                pointsOrdered[indexToOffset[int(ringMap["neg"])]],
-            ],
-            axis=0,
-        )
-    return ringPoints
-
-
-def _build_segment_axes(*, jointCenters: dict[str, np.ndarray]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    axes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for finger in FINGER_NAMES:
-        for segIdx in range(1, 4):
-            proximal = jointCenters[f"{finger}_joint_{segIdx}"]
-            distal = jointCenters[f"{finger}_tip"] if segIdx == 3 else jointCenters[f"{finger}_joint_{segIdx + 1}"]
-            axes[f"{finger}_segment_{segIdx}"] = (proximal, distal)
-    return axes
-
-
-def _segment_to_finger(segmentName: str) -> str:
-    for finger in FINGER_NAMES:
-        if segmentName.startswith(finger):
-            return finger
-    raise KeyError(f"unknown segment name: {segmentName}")
-
-
-def _joint_to_finger(jointName: str) -> str:
-    for finger in FINGER_NAMES:
-        if jointName.startswith(finger):
-            return finger
-    raise KeyError(f"unknown joint name: {jointName}")
 
 
 def _build_ring_joint_frame_data(
@@ -341,9 +126,9 @@ def _build_ring_joint_frame_data(
     predVerts: np.ndarray,
     predJoints: np.ndarray,
 ) -> dict[str, Any]:
-    ringPoints = _build_ring_points(template=estimator.template, pointsOrdered=orderedPoints)
-    jointCenters = _build_joint_centers(template=estimator.template, pointsOrdered=orderedPoints)
-    segmentAxes = _build_segment_axes(jointCenters=jointCenters)
+    ringPoints = build_ring_points(template=estimator.template, points_ordered=orderedPoints)
+    jointCenters = build_joint_centers(template=estimator.template, points_ordered=orderedPoints)
+    segmentAxes = build_segment_axes(joint_centers=jointCenters)
     rootPoints = build_root_points(estimator.template, orderedPoints)
     rootOrigin, rootAxes, rootAxisLength = build_wrist_frame(rootPoints)
     return {
@@ -363,17 +148,17 @@ def _plot_ring_joint_panel(
     fingerColors: dict[str, np.ndarray],
 ) -> None:
     for segmentName, ring in data["ring_points"].items():
-        finger = _segment_to_finger(segmentName)
+        finger = segment_name_to_finger(segmentName)
         color = fingerColors[finger]
-        tri = Poly3DCollection([ring], facecolor=color, edgecolor=color, alpha=0.28, linewidths=0.7)
-        ax.add_collection3d(tri)
+        verts = np.asarray(ring, dtype=np.float32)
+        plot_mesh(ax, verts, np.array([[0, 1, 2]], dtype=np.int64), color=color, alpha=0.28)
         ax.scatter(ring[:, 0], ring[:, 1], ring[:, 2], s=11, c=color[None, :], depthshade=False)
     for jointName, center in data["joint_centers"].items():
-        finger = _joint_to_finger(jointName)
+        finger = joint_name_to_finger(jointName)
         color = fingerColors[finger]
         ax.scatter([center[0]], [center[1]], [center[2]], s=11, c=color[None, :], depthshade=False)
     for segmentName, (start, end) in data["segment_axes"].items():
-        finger = _segment_to_finger(segmentName)
+        finger = segment_name_to_finger(segmentName)
         color = fingerColors[finger]
         ax.plot(
             [start[0], end[0]],
@@ -387,7 +172,7 @@ def _plot_ring_joint_panel(
     axisLength = float(data["root_axis_length"]) * 0.85
     ax.scatter([origin[0]], [origin[1]], [origin[2]], s=ROOT_AXIS_ORIGIN_SIZE * 1.2, c="#f2c14e", depthshade=False)
     for axisName, direction in data["root_axes"].items():
-        _plot_round_arrow(
+        plot_round_arrow(
             ax,
             origin=origin,
             direction=np.asarray(direction, dtype=np.float32),
@@ -395,6 +180,7 @@ def _plot_ring_joint_panel(
             radius=ROOT_AXIS_RADIUS,
             color=AXIS_COLORS[axisName],
             alpha=0.95,
+            arrow_ratio=ROOT_AXIS_ARROW_RATIO,
         )
 
 
@@ -416,6 +202,41 @@ def _save_video(frameDir: Path, outputPath: Path, fps: int) -> bool:
         str(outputPath),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+def _save_gif(frameDir: Path, outputPath: Path, fps: int) -> bool:
+    ffmpegPath = shutil.which("ffmpeg")
+    if ffmpegPath is None:
+        return False
+    with tempfile.TemporaryDirectory(prefix="semantic_mano_ik_palette_") as tmpDir:
+        palettePath = Path(tmpDir) / "palette.png"
+        paletteCmd = [
+            ffmpegPath,
+            "-y",
+            "-framerate",
+            str(fps),
+            "-i",
+            str(frameDir / "frame_%04d.png"),
+            "-vf",
+            "palettegen=stats_mode=diff",
+            str(palettePath),
+        ]
+        gifCmd = [
+            ffmpegPath,
+            "-y",
+            "-framerate",
+            str(fps),
+            "-i",
+            str(frameDir / "frame_%04d.png"),
+            "-i",
+            str(palettePath),
+            "-lavfi",
+            "paletteuse=dither=sierra2_4a",
+            str(outputPath),
+        ]
+        subprocess.run(paletteCmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(gifCmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 
@@ -441,7 +262,7 @@ def _render_sequence_frames(
         leftAx = fig.add_subplot(121, projection="3d")
         rightAx = fig.add_subplot(122, projection="3d")
 
-        _plot_mesh(leftAx, gtVertsSeq[frameIdx], faces, color=GT_MESH_COLOR, alpha=0.34)
+        plot_mesh(leftAx, gtVertsSeq[frameIdx], faces, color=GT_MESH_COLOR, alpha=0.34)
         leftAx.scatter(
             gtPointsSeq[frameIdx, :, 0],
             gtPointsSeq[frameIdx, :, 1],
@@ -450,11 +271,11 @@ def _render_sequence_frames(
             c=GT_POINT_COLOR,
             depthshade=False,
         )
-        _set_axes_equal(leftAx, framePoints, zoom=zoom)
-        _style_ax(leftAx, f"GT MANO + 100 semantic points\n{sampleName} | {handSide} | frame {frameIdx:03d}")
+        set_axes_equal(leftAx, framePoints, zoom=zoom)
+        style_3d_axes(leftAx)
         leftAx.view_init(elev=elev, azim=azim)
 
-        _plot_mesh(rightAx, predVertsSeq[frameIdx], faces, color=PRED_MESH_COLOR, alpha=0.34)
+        plot_mesh(rightAx, predVertsSeq[frameIdx], faces, color=PRED_MESH_COLOR, alpha=0.34)
         rightAx.scatter(
             gtPointsSeq[frameIdx, :, 0],
             gtPointsSeq[frameIdx, :, 1],
@@ -471,15 +292,22 @@ def _render_sequence_frames(
             c=REPROJ_POINT_COLOR,
             depthshade=False,
         )
-        _set_axes_equal(rightAx, framePoints, zoom=zoom)
-        _style_ax(
+        set_axes_equal(rightAx, framePoints, zoom=zoom)
+        style_3d_axes(
             rightAx,
-            "IK from 100 points\n"
-            f"{_build_metric_caption(frameMetrics, frameIdx)}",
+            None,
+        )
+        fig.text(
+            0.5,
+            0.015,
+            _build_metric_caption(frameMetrics, frameIdx),
+            ha="center",
+            va="bottom",
+            fontsize=METRIC_TEXT_FONTSIZE,
         )
         rightAx.view_init(elev=elev, azim=azim)
 
-        fig.tight_layout()
+        fig.subplots_adjust(left=0.01, right=0.99, top=0.995, bottom=0.055, wspace=0.02)
         fig.savefig(frameDir / f"frame_{frameIdx:04d}.png", dpi=180, bbox_inches="tight")
         plt.close(fig)
 
@@ -497,6 +325,13 @@ def _render_bimanual_frames(
     frameDir.mkdir(parents=True, exist_ok=True)
     numFrames = min(leftData["gt_verts"].shape[0], rightData["gt_verts"].shape[0])
     sharedFingerColors = _build_finger_palette(0.00)
+    usableWidth = BIMANUAL_RIGHT - BIMANUAL_LEFT
+    colWidth = (usableWidth - BIMANUAL_WSPACE * 3.0) / 4.0
+    axesHeight = BIMANUAL_TOP - BIMANUAL_BOTTOM
+
+    def _col_left(colIdx: int) -> float:
+        return BIMANUAL_LEFT + colIdx * (colWidth + BIMANUAL_WSPACE)
+
     for frameIdx in range(numFrames):
         framePoints = np.concatenate(
             [
@@ -507,16 +342,16 @@ def _render_bimanual_frames(
             ],
             axis=0,
         )
-        fig = plt.figure(figsize=(23.0, 6.4))
-        gtMeshAx = fig.add_subplot(141, projection="3d")
-        semanticAx = fig.add_subplot(142, projection="3d")
-        ringJointAx = fig.add_subplot(143, projection="3d")
-        overlayAx = fig.add_subplot(144, projection="3d")
+        fig = plt.figure(figsize=BIMANUAL_FIGSIZE)
+        gtMeshAx = fig.add_axes([_col_left(0), BIMANUAL_BOTTOM, colWidth, axesHeight], projection="3d")
+        semanticAx = fig.add_axes([_col_left(1), BIMANUAL_BOTTOM, colWidth, axesHeight], projection="3d")
+        ringJointAx = fig.add_axes([_col_left(2), BIMANUAL_BOTTOM, colWidth, axesHeight], projection="3d")
+        overlayAx = fig.add_axes([_col_left(3), BIMANUAL_BOTTOM, colWidth, axesHeight], projection="3d")
 
-        _plot_mesh(gtMeshAx, leftData["gt_verts"][frameIdx], leftData["faces"], color=LEFT_MESH_COLOR, alpha=0.56)
-        _plot_mesh(gtMeshAx, rightData["gt_verts"][frameIdx], rightData["faces"], color=RIGHT_MESH_COLOR, alpha=0.56)
-        _set_axes_equal(gtMeshAx, framePoints, zoom=zoom)
-        _style_ax(gtMeshAx, f"GT Mesh\n{sampleName} | frame {frameIdx:03d}")
+        plot_mesh(gtMeshAx, leftData["gt_verts"][frameIdx], leftData["faces"], color=LEFT_MESH_COLOR, alpha=0.56)
+        plot_mesh(gtMeshAx, rightData["gt_verts"][frameIdx], rightData["faces"], color=RIGHT_MESH_COLOR, alpha=0.56)
+        set_axes_equal(gtMeshAx, framePoints, zoom=zoom)
+        style_3d_axes(gtMeshAx, "GT Mesh")
         gtMeshAx.view_init(elev=elev, azim=azim)
 
         semanticAx.scatter(
@@ -535,8 +370,8 @@ def _render_bimanual_frames(
             c=RIGHT_POINT_COLOR,
             depthshade=False,
         )
-        _set_axes_equal(semanticAx, framePoints, zoom=zoom)
-        _style_ax(semanticAx, "100 Semantic Points")
+        set_axes_equal(semanticAx, framePoints, zoom=zoom)
+        style_3d_axes(semanticAx, "100 Semantic Points")
         semanticAx.view_init(elev=elev, azim=azim)
 
         _plot_ring_joint_panel(
@@ -549,25 +384,31 @@ def _render_bimanual_frames(
             data=rightData["ring_joint"][frameIdx],
             fingerColors=sharedFingerColors,
         )
-        _set_axes_equal(ringJointAx, framePoints, zoom=zoom)
-        _style_ax(ringJointAx, "Single-Step Ring-Joint")
+        set_axes_equal(ringJointAx, framePoints, zoom=zoom)
+        style_3d_axes(ringJointAx, "Single-Step Ring Joint")
         ringJointAx.view_init(elev=elev, azim=azim)
 
-        _plot_mesh(overlayAx, leftData["gt_verts"][frameIdx], leftData["faces"], color=LEFT_MESH_COLOR, alpha=0.22)
-        _plot_mesh(overlayAx, rightData["gt_verts"][frameIdx], rightData["faces"], color=RIGHT_MESH_COLOR, alpha=0.22)
-        _plot_mesh(overlayAx, leftData["pred_verts"][frameIdx], leftData["faces"], color=PRED_MESH_COLOR_UNIFIED, alpha=0.62)
-        _plot_mesh(overlayAx, rightData["pred_verts"][frameIdx], rightData["faces"], color=PRED_MESH_COLOR_UNIFIED, alpha=0.62)
-        _set_axes_equal(overlayAx, framePoints, zoom=zoom)
-        _style_ax(
-            overlayAx,
-            "Single-Step Mesh + GT Mesh\n"
-            f"L {_build_metric_caption(leftData['frame_metrics'], frameIdx)} | "
-            f"R {_build_metric_caption(rightData['frame_metrics'], frameIdx)}",
-        )
+        plot_mesh(overlayAx, leftData["gt_verts"][frameIdx], leftData["faces"], color=LEFT_MESH_COLOR, alpha=0.22)
+        plot_mesh(overlayAx, rightData["gt_verts"][frameIdx], rightData["faces"], color=RIGHT_MESH_COLOR, alpha=0.22)
+        plot_mesh(overlayAx, leftData["pred_verts"][frameIdx], leftData["faces"], color=PRED_MESH_COLOR_UNIFIED, alpha=0.62)
+        plot_mesh(overlayAx, rightData["pred_verts"][frameIdx], rightData["faces"], color=PRED_MESH_COLOR_UNIFIED, alpha=0.62)
+        set_axes_equal(overlayAx, framePoints, zoom=zoom)
+        style_3d_axes(overlayAx, "Single-Step Mesh+GT Mesh")
         overlayAx.view_init(elev=elev, azim=azim)
 
-        fig.tight_layout()
-        fig.savefig(frameDir / f"frame_{frameIdx:04d}.png", dpi=180, bbox_inches="tight")
+        for axis in (gtMeshAx, semanticAx, ringJointAx, overlayAx):
+            axis.title.set_fontsize(BIMANUAL_TITLE_FONTSIZE)
+
+        fig.text(
+            0.5,
+            BIMANUAL_METRIC_Y,
+            f"L {_build_metric_caption(leftData['frame_metrics'], frameIdx)}    |    "
+            f"R {_build_metric_caption(rightData['frame_metrics'], frameIdx)}",
+            ha="center",
+            va="bottom",
+            fontsize=METRIC_TEXT_FONTSIZE,
+        )
+        fig.savefig(frameDir / f"frame_{frameIdx:04d}.png", dpi=180)
         plt.close(fig)
 
 
@@ -586,6 +427,7 @@ def _run_single_hand(
     azim: float,
     fps: int,
     skipVideo: bool,
+    persistOutputs: bool,
 ) -> dict[str, Any]:
     estimator = leftEstimator if handSide == "left" else rightEstimator
     reorderIndex, detectedSourceHand = resolve_input_reorder(
@@ -660,33 +502,8 @@ def _run_single_hand(
     predJointsArr = np.stack(predJointsSeq, axis=0).astype(np.float32)
     reprojPointsArr = np.stack(reprojPointsSeq, axis=0).astype(np.float32)
 
-    outputDir.mkdir(parents=True, exist_ok=True)
-    np.save(outputDir / "gt_mano_sequence.npy", manoSeq.astype(np.float32))
-    np.save(outputDir / "gt_vertices_sequence.npy", gtVertsArr)
-    np.save(outputDir / "gt_joints_sequence.npy", gtJointsArr)
-    np.save(outputDir / "semantic_points_100_sequence.npy", gtPointsArr)
-    np.save(outputDir / "ik_mano_sequence.npy", predManoArr)
-    np.save(outputDir / "ik_vertices_sequence.npy", predVertsArr)
-    np.save(outputDir / "ik_joints_sequence.npy", predJointsArr)
-    np.save(outputDir / "ik_reprojected_points_sequence.npy", reprojPointsArr)
-
-    frameDir = outputDir / "frames"
-    _render_sequence_frames(
-        frameDir=frameDir,
-        sampleName=sampleName,
-        handSide=handSide,
-        gtVertsSeq=gtVertsArr,
-        gtPointsSeq=gtPointsArr,
-        predVertsSeq=predVertsArr,
-        reprojPointsSeq=reprojPointsArr,
-        frameMetrics=frameMetrics,
-        faces=faces,
-        elev=elev,
-        azim=azim,
-        zoom=1.0,
-    )
-    videoPath = outputDir / "sequence_visualization.mp4"
-    videoSaved = False if skipVideo else _save_video(frameDir, videoPath, fps)
+    videoSaved = False
+    gifSaved = False
 
     summary = {
         "sample_name": sampleName,
@@ -702,20 +519,57 @@ def _run_single_hand(
         "vertex_max_mm": float(np.max([item["vertex_max_mm"] for item in frameMetrics])),
         "fallback_count_total": int(sum(item["fallback_count"] for item in frameMetrics)),
         "video_saved": bool(videoSaved),
+        "gif_saved": bool(gifSaved),
     }
-    (outputDir / "frame_metrics.json").write_text(json.dumps(frameMetrics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    (outputDir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    payload = {
-        "sample_name": sampleName,
-        "hand_side": handSide,
-        "source_hand_side": detectedSourceHand,
-        "sample_index_order": sampleIndices.astype(np.int64),
-        "gt_mano_sequence": manoSeq.astype(np.float32),
-        "semantic_points_100_sequence": gtPointsArr,
-        "ik_mano_sequence": predManoArr,
-        "ik_reprojected_points_sequence": reprojPointsArr,
-    }
-    np.save(outputDir / "sequence_payload.npy", payload, allow_pickle=True)
+    if persistOutputs:
+        outputDir.mkdir(parents=True, exist_ok=True)
+        np.save(outputDir / "gt_mano_sequence.npy", manoSeq.astype(np.float32))
+        np.save(outputDir / "gt_vertices_sequence.npy", gtVertsArr)
+        np.save(outputDir / "gt_joints_sequence.npy", gtJointsArr)
+        np.save(outputDir / "semantic_points_100_sequence.npy", gtPointsArr)
+        np.save(outputDir / "ik_mano_sequence.npy", predManoArr)
+        np.save(outputDir / "ik_vertices_sequence.npy", predVertsArr)
+        np.save(outputDir / "ik_joints_sequence.npy", predJointsArr)
+        np.save(outputDir / "ik_reprojected_points_sequence.npy", reprojPointsArr)
+
+        frameDir = outputDir / "frames"
+        _render_sequence_frames(
+            frameDir=frameDir,
+            sampleName=sampleName,
+            handSide=handSide,
+            gtVertsSeq=gtVertsArr,
+            gtPointsSeq=gtPointsArr,
+            predVertsSeq=predVertsArr,
+            reprojPointsSeq=reprojPointsArr,
+            frameMetrics=frameMetrics,
+            faces=faces,
+            elev=elev,
+            azim=azim,
+            zoom=1.0,
+        )
+        videoPath = outputDir / "sequence_visualization.mp4"
+        videoSaved = False if skipVideo else _save_video(frameDir, videoPath, fps)
+        gifPath = outputDir / "sequence_visualization.gif"
+        gifSaved = False if skipVideo else _save_gif(frameDir, gifPath, fps)
+        if videoSaved or gifSaved:
+            shutil.rmtree(frameDir, ignore_errors=True)
+
+        (outputDir / "frame_metrics.json").write_text(
+            json.dumps(frameMetrics, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (outputDir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        payload = {
+            "sample_name": sampleName,
+            "hand_side": handSide,
+            "source_hand_side": detectedSourceHand,
+            "sample_index_order": sampleIndices.astype(np.int64),
+            "gt_mano_sequence": manoSeq.astype(np.float32),
+            "semantic_points_100_sequence": gtPointsArr,
+            "ik_mano_sequence": predManoArr,
+            "ik_reprojected_points_sequence": reprojPointsArr,
+        }
+        np.save(outputDir / "sequence_payload.npy", payload, allow_pickle=True)
     return {
         "summary": summary,
         "gt_verts": gtVertsArr,
@@ -725,7 +579,7 @@ def _run_single_hand(
         "faces": faces,
         "ring_joint": ringJointSeq,
         "frame_metrics": frameMetrics,
-        "output_dir": outputDir,
+        "output_dir": outputDir if persistOutputs else None,
     }
 
 
@@ -734,7 +588,7 @@ def main() -> None:
     manoDatasetPath = Path(args.mano_dataset_path)
     outputRoot = Path(args.output_dir)
     sampleIndices = np.load(str(args.sample_index_path)).astype(np.int64).reshape(-1)
-    sampleKey, entry, keys = _load_sequence_entry(manoDatasetPath, args.sample_key, args.sample_index)
+    sampleKey, entry, keys = load_sequence_entry(manoDatasetPath, args.sample_key, args.sample_index)
     handSides = ["left", "right"] if args.hand_side == "both" else [args.hand_side]
     manoPath = resolveManoPath(manoPath=args.mano_path, projectRoot=PROJECT_ROOT)
 
@@ -767,8 +621,9 @@ def main() -> None:
         "outputs": {},
     }
     handResults: dict[str, dict[str, Any]] = {}
+    persistSingleHandOutputs = len(handSides) == 1
     for handSide in handSides:
-        manoSeq = _build_mano_sequence(entry, handSide=handSide)
+        manoSeq = build_mano_sequence(entry, hand_side=handSide)
         if args.max_frames is not None:
             manoSeq = manoSeq[: args.max_frames]
         sampleName = f"{manoDatasetPath.stem}_sample_{sampleKey}"
@@ -787,13 +642,15 @@ def main() -> None:
             azim=args.azim,
             fps=args.fps,
             skipVideo=args.skip_video,
+            persistOutputs=persistSingleHandOutputs,
         )
         summary = result["summary"]
         handResults[handSide] = result
-        manifest["outputs"][handSide] = {
-            "dir": str(handOutputDir.resolve()),
-            "summary": summary,
-        }
+        if persistSingleHandOutputs:
+            manifest["outputs"][handSide] = {
+                "dir": str(handOutputDir.resolve()),
+                "summary": summary,
+            }
 
     if set(handSides) == {"left", "right"}:
         sampleName = f"{manoDatasetPath.stem}_sample_{sampleKey}"
@@ -811,12 +668,17 @@ def main() -> None:
         videoPath = bimanualDir / "sequence_visualization.mp4"
         bimanualDir.mkdir(parents=True, exist_ok=True)
         videoSaved = False if args.skip_video else _save_video(frameDir, videoPath, args.fps)
+        gifPath = bimanualDir / "sequence_visualization.gif"
+        gifSaved = False if args.skip_video else _save_gif(frameDir, gifPath, args.fps)
+        if videoSaved or gifSaved:
+            shutil.rmtree(frameDir, ignore_errors=True)
         bimanualSummary = {
             "sample_name": sampleName,
             "hand_side": "both",
             "num_frames": int(min(handResults["left"]["gt_verts"].shape[0], handResults["right"]["gt_verts"].shape[0])),
             "camera": {"elev": float(args.elev), "azim": float(args.azim)},
             "video_saved": bool(videoSaved),
+            "gif_saved": bool(gifSaved),
             "left_point_rmse_mm": float(handResults["left"]["summary"]["point_rmse_mm"]),
             "right_point_rmse_mm": float(handResults["right"]["summary"]["point_rmse_mm"]),
             "left_vertex_rmse_mm": float(handResults["left"]["summary"]["vertex_rmse_mm"]),

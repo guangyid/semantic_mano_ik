@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict
 
@@ -18,23 +18,25 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utils.mano.anchors import SMPLX_SEGMENT_ORDER, buildAnchorScene, buildFlatHandAnchorTemplate, loadFlatHandMano, selectFingerAndPalmGroups
 from utils.mano.approx import ApproxForwardManoEstimator
-from utils.mano.helpers import build_root_points, build_wrist_frame, decode_single_hand_mano
+from utils.mano.helpers import (
+    FINGER_NAMES,
+    JOINT_LEVELS,
+    build_joint_centers,
+    build_mesh_fingertips,
+    build_mesh_joint_centers,
+    build_ring_points,
+    build_segment_axes,
+    build_root_points,
+    build_wrist_frame,
+    decode_single_hand_mano,
+)
 from utils.mano.mano_load import createManoLayer, resolveManoPath
 from utils.mano.payload import load_payload_file, load_single_hand_points, resolve_input_reorder
 from utils.mano.reorder import resolveApproxIkInputOrders
 from utils.vis.trimesh_vis import add_axes, add_cylinder, add_sphere, build_hand_mesh
 
 
-FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
-JOINT_LEVELS = ["joint_1", "joint_2", "joint_3", "tip"]
-FINGER_JOINT_GROUPS = OrderedDict([
-    ("thumb", (13, 14, 15)),
-    ("index", (1, 2, 3)),
-    ("middle", (4, 5, 6)),
-    ("ring", (10, 11, 12)),
-    ("pinky", (7, 8, 9)),
-])
-DEFAULT_SAMPLE_PATH = PROJECT_ROOT / "samples" / "ring_joint_demo.npy"
+DEFAULT_SAMPLE_PATH = PROJECT_ROOT / "outputs" / "ring_joint_demo.npy"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
 POINT_COLOR = np.array([240, 190, 80, 235], dtype=np.uint8)
 ROOT_COLOR = np.array([255, 90, 90, 255], dtype=np.uint8)
@@ -253,79 +255,6 @@ def _build_hand_geometry(*, mano_layer, mano_params: torch.Tensor, hand_side: st
     return mesh
 
 
-def _normalize(vec: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
-    return vec / vec.norm(dim=-1, keepdim=True).clamp(min=eps)
-
-
-def _build_mesh_fingertips(*, verts: torch.Tensor, joints: torch.Tensor) -> torch.Tensor:
-    distal_indices = [group[-1] for group in FINGER_JOINT_GROUPS.values()]
-    proximal_indices = [group[-2] for group in FINGER_JOINT_GROUPS.values()]
-    distal = joints[distal_indices]
-    proximal = joints[proximal_indices]
-    directions = _normalize(distal - proximal)
-    dist = torch.cdist(verts.unsqueeze(0), distal.unsqueeze(0)).squeeze(0)
-    assignment = torch.argmin(dist, dim=-1)
-    tips: list[torch.Tensor] = []
-    for finger_idx in range(len(distal_indices)):
-        mask = assignment == finger_idx
-        if not bool(mask.any().item()):
-            tips.append(distal[finger_idx])
-            continue
-        rel = verts[mask] - distal[finger_idx]
-        proj = (rel * directions[finger_idx]).sum(dim=-1)
-        dist_norm = rel.norm(dim=-1)
-        score = proj - 0.2 * dist_norm
-        tips.append(verts[mask][torch.argmax(score)])
-    return torch.stack(tips, dim=0)
-
-
-def _build_joint_centers(*, template, points_ordered: np.ndarray) -> dict[str, np.ndarray]:
-    index_to_offset = {int(index): offset for offset, index in enumerate(template.indexOrder)}
-    centers: dict[str, np.ndarray] = {}
-    for finger in FINGER_NAMES:
-        for level in JOINT_LEVELS:
-            pair_name = f"{finger}_{level}"
-            pair = template.jointPairMap[pair_name]
-            pos = points_ordered[index_to_offset[int(pair["pos"])]]
-            neg = points_ordered[index_to_offset[int(pair["neg"])]]
-            centers[pair_name] = 0.5 * (pos + neg)
-    return centers
-
-
-def _build_mesh_joint_centers(*, mesh_joints: np.ndarray, mesh_tips: np.ndarray) -> dict[str, np.ndarray]:
-    centers: dict[str, np.ndarray] = {}
-    for finger_name, joint_ids in FINGER_JOINT_GROUPS.items():
-        for idx, joint_id in enumerate(joint_ids):
-            centers[f"{finger_name}_joint_{idx + 1}"] = mesh_joints[joint_id]
-        centers[f"{finger_name}_tip"] = mesh_tips[FINGER_NAMES.index(finger_name)]
-    return centers
-
-
-def _build_ring_points(*, template, points_ordered: np.ndarray) -> dict[str, np.ndarray]:
-    index_to_offset = {int(index): offset for offset, index in enumerate(template.indexOrder)}
-    ring_points: dict[str, np.ndarray] = {}
-    for segment_name, ring_map in template.segmentRingMap.items():
-        ring_points[segment_name] = np.stack(
-            [
-                points_ordered[index_to_offset[int(ring_map["mid"])]],
-                points_ordered[index_to_offset[int(ring_map["pos"])]],
-                points_ordered[index_to_offset[int(ring_map["neg"])]],
-            ],
-            axis=0,
-        )
-    return ring_points
-
-
-def _build_segment_axes(*, joint_centers: dict[str, np.ndarray]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    axes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for finger in FINGER_NAMES:
-        for seg_idx in range(1, 4):
-            proximal = joint_centers[f"{finger}_joint_{seg_idx}"]
-            distal = joint_centers[f"{finger}_tip"] if seg_idx == 3 else joint_centers[f"{finger}_joint_{seg_idx + 1}"]
-            axes[f"{finger}_segment_{seg_idx}"] = (proximal, distal)
-    return axes
-
-
 def _darken_color(color: np.ndarray, factor: float = 0.35) -> np.ndarray:
     rgb = np.clip(color[:3].astype(np.float32) * float(factor), 0.0, 255.0)
     return np.array([int(rgb[0]), int(rgb[1]), int(rgb[2]), int(color[3])], dtype=np.uint8)
@@ -349,9 +278,9 @@ def _render_hand(
     link_radius: float,
 ) -> None:
     points_ordered = points_world[reorder_index]
-    ring_points = _build_ring_points(template=estimator.template, points_ordered=points_ordered)
-    joint_centers = _build_joint_centers(template=estimator.template, points_ordered=points_ordered)
-    segment_axes = _build_segment_axes(joint_centers=joint_centers)
+    ring_points = build_ring_points(template=estimator.template, points_ordered=points_ordered)
+    joint_centers = build_joint_centers(template=estimator.template, points_ordered=points_ordered)
+    segment_axes = build_segment_axes(joint_centers=joint_centers)
 
     segment_names = list(SMPLX_SEGMENT_ORDER)
     ring_colors = _build_palette(len(segment_names), ring_hue_offset)
@@ -370,8 +299,11 @@ def _render_hand(
 
     mesh_joints = _decode_hand_joints(mano_layer=mano_layer, mano_params=mano_params, hand_side=hand_side)[0, -1]
     mesh_verts = _decode_hand_verts(mano_layer=mano_layer, mano_params=mano_params, hand_side=hand_side)[0, -1]
-    mesh_tips = _build_mesh_fingertips(verts=mesh_verts, joints=mesh_joints)
-    mesh_joint_centers = _build_mesh_joint_centers(mesh_joints=mesh_joints.detach().cpu().numpy(), mesh_tips=mesh_tips.detach().cpu().numpy())
+    mesh_tips = build_mesh_fingertips(verts=mesh_verts, joints=mesh_joints)
+    mesh_joint_centers = build_mesh_joint_centers(
+        mesh_joints=mesh_joints.detach().cpu().numpy(),
+        mesh_tips=mesh_tips.detach().cpu().numpy(),
+    )
 
     for joint_name, center in joint_centers.items():
         color = joint_color_map[joint_name]

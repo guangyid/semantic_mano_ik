@@ -32,6 +32,49 @@ def load_payload_file(path: str | Path) -> Any:
     return loaded
 
 
+def sorted_sample_keys(payload: dict[str, Any]) -> list[str]:
+    def _sort_key(text: str) -> tuple[int, str]:
+        return (0, f"{int(text):08d}") if text.isdigit() else (1, text)
+
+    return sorted(payload.keys(), key=_sort_key)
+
+
+def unwrap_object_scalar(value: Any) -> Any:
+    if isinstance(value, np.ndarray) and value.shape == () and value.dtype == object:
+        return value.item()
+    return value
+
+
+def load_sequence_entry(dataset_path: str | Path, sample_key: str | None, sample_index: int) -> tuple[str, dict[str, Any], list[str]]:
+    payload = load_payload_file(dataset_path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{dataset_path} must be an npz or dict containing multiple samples")
+    keys = sorted_sample_keys(payload)
+    if not keys:
+        raise ValueError(f"{dataset_path} does not contain any samples")
+    resolved_key = sample_key if sample_key is not None else keys[sample_index]
+    if resolved_key not in payload:
+        raise KeyError(f"{dataset_path} does not contain sample key={resolved_key}; available keys: {keys}")
+    entry = unwrap_object_scalar(payload[resolved_key])
+    if not isinstance(entry, dict):
+        raise ValueError(f"{dataset_path}:{resolved_key} is not a dict payload")
+    return resolved_key, entry, keys
+
+
+def build_mano_sequence(entry: dict[str, Any], *, hand_side: str) -> np.ndarray:
+    prefix = "left" if hand_side == "left" else "right"
+    pose = np.asarray(entry[f"{prefix}_pose"], dtype=np.float32)
+    transl = np.asarray(entry[f"{prefix}_trans"], dtype=np.float32)
+    shape = np.asarray(entry[f"{prefix}_shape"], dtype=np.float32)
+    if pose.ndim != 2 or pose.shape[1] != 48:
+        raise ValueError(f"{prefix}_pose must have shape [T,48], got {pose.shape}")
+    if transl.shape != (pose.shape[0], 3):
+        raise ValueError(f"{prefix}_trans must have shape [T,3], got {transl.shape}")
+    if shape.shape != (pose.shape[0], 10):
+        raise ValueError(f"{prefix}_shape must have shape [T,10], got {shape.shape}")
+    return np.concatenate([pose, transl, shape], axis=1).astype(np.float32)
+
+
 def normalize_points_array(points: np.ndarray, *, name: str) -> np.ndarray:
     arr = np.asarray(points, dtype=np.float32)
     if arr.shape == (100, 3):

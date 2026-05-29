@@ -47,6 +47,32 @@ def _build_single_hand_init(full_mano: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 
+def _save_single_sample_result(
+    *,
+    output_dir: Path,
+    stem: str,
+    mano_params: torch.Tensor,
+    metrics: dict[str, float],
+    known_shape_tag: str,
+    single_ik_point_rmse_cm: float,
+    glb_path: Path | None,
+) -> None:
+    np.save(str(output_dir / "refine_ik_mano_params.npy"), mano_params[0].detach().cpu().numpy().astype(np.float32))
+    payload = {
+        "sample_name": stem,
+        "method": "refine_ik",
+        "known_shape_source": known_shape_tag,
+        "single_ik_point_rmse_cm": float(single_ik_point_rmse_cm),
+        **metrics,
+    }
+    (output_dir / "refine_ik_metrics.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    if glb_path is not None and glb_path.is_file():
+        glb_path.replace(output_dir / "refine_ik_visualization.glb")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Refine IK from 100 semantic points")
     parser.add_argument("--input-path", type=str, required=True)
@@ -90,6 +116,7 @@ def main() -> None:
     if args.export_glb:
         glb_dir.mkdir(parents=True, exist_ok=True)
 
+    compact_result: dict[str, object] | None = None
     for stem in target_stems:
         sample_index = stems.index(stem)
         sample = extract_sample_payload(payload, sample_index, sample_count)
@@ -142,11 +169,10 @@ def main() -> None:
             **refine_metrics,
             "single_ik_point_rmse_cm": single_metrics["point_rmse_cm"],
         })
-        np.save(str(output_dir / f"{stem}_single_ik.npy"), single_ik.detach().cpu().numpy())
-        np.save(str(output_dir / f"{stem}_refine_ik.npy"), refine_ik.detach().cpu().numpy())
+        glb_path = glb_dir / f"{stem}_refine_ik.glb" if args.export_glb else None
         if args.export_glb:
             export_hand_comparison_glb(
-                output_path=glb_dir / f"{stem}_refine_ik.glb",
+                output_path=glb_path,
                 variant_name="refine_ik",
                 mano_params=refine_ik,
                 target_left_points=left_points,
@@ -154,6 +180,30 @@ def main() -> None:
                 mano_layer=mano_layer,
                 sample_indices=sample_indices,
             )
+        if len(target_stems) == 1:
+            compact_result = {
+                "stem": stem,
+                "mano_params": refine_ik,
+                "metrics": refine_metrics,
+                "known_shape_tag": known_shape_tag,
+                "single_ik_point_rmse_cm": single_metrics["point_rmse_cm"],
+                "glb_path": glb_path,
+            }
+
+    if len(target_stems) == 1 and compact_result is not None:
+        _save_single_sample_result(
+            output_dir=output_dir,
+            stem=str(compact_result["stem"]),
+            mano_params=compact_result["mano_params"],
+            metrics=compact_result["metrics"],
+            known_shape_tag=str(compact_result["known_shape_tag"]),
+            single_ik_point_rmse_cm=float(compact_result["single_ik_point_rmse_cm"]),
+            glb_path=compact_result["glb_path"],
+        )
+        if glb_dir.exists():
+            glb_dir.rmdir()
+        print(f"[OK] metrics: {output_dir / 'refine_ik_metrics.json'}")
+        return
 
     csv_path = output_dir / "refine_ik_metrics.csv"
     fieldnames = list(rows[0].keys())

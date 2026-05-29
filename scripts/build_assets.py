@@ -63,7 +63,7 @@ def main() -> None:
     sample_parser.add_argument("--mano-path", type=str, default=None)
     sample_parser.add_argument("--sample-index-path", type=str, default="assets/part_ik_hand_index_100.npy")
     sample_parser.add_argument("--axis-prior-path", type=str, default="assets/mano_flat_hand_axis_prior.npy")
-    sample_parser.add_argument("--output-path", type=str, default="samples/ring_joint_demo.npy")
+    sample_parser.add_argument("--output-path", type=str, default="outputs/ring_joint_demo.npy")
 
     all_parser = subparsers.add_parser("all", help="Build the semantic index file and axis prior together")
     all_parser.add_argument("--mano-path", type=str, default="assets/mano")

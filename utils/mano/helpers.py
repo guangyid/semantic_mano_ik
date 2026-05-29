@@ -1,8 +1,21 @@
 """Small MANO-centric helper functions used by CLI scripts."""
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import numpy as np
 import torch
+
+
+FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
+JOINT_LEVELS = ["joint_1", "joint_2", "joint_3", "tip"]
+FINGER_JOINT_GROUPS = OrderedDict([
+    ("thumb", (13, 14, 15)),
+    ("index", (1, 2, 3)),
+    ("middle", (4, 5, 6)),
+    ("ring", (10, 11, 12)),
+    ("pinky", (7, 8, 9)),
+])
 
 
 def decode_single_hand_mano(
@@ -76,3 +89,90 @@ def build_wrist_frame(rootPoints: dict[str, np.ndarray]) -> tuple[np.ndarray, di
         "y": y_axis.astype(np.float32),
         "z": z_axis.astype(np.float32),
     }, axis_length
+
+
+def _normalize_torch(vec: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
+    return vec / vec.norm(dim=-1, keepdim=True).clamp(min=eps)
+
+
+def build_mesh_fingertips(*, verts: torch.Tensor, joints: torch.Tensor) -> torch.Tensor:
+    distal_indices = [group[-1] for group in FINGER_JOINT_GROUPS.values()]
+    proximal_indices = [group[-2] for group in FINGER_JOINT_GROUPS.values()]
+    distal = joints[distal_indices]
+    proximal = joints[proximal_indices]
+    directions = _normalize_torch(distal - proximal)
+    dist = torch.cdist(verts.unsqueeze(0), distal.unsqueeze(0)).squeeze(0)
+    assignment = torch.argmin(dist, dim=-1)
+    tips: list[torch.Tensor] = []
+    for finger_idx in range(len(distal_indices)):
+        mask = assignment == finger_idx
+        if not bool(mask.any().item()):
+            tips.append(distal[finger_idx])
+            continue
+        rel = verts[mask] - distal[finger_idx]
+        proj = (rel * directions[finger_idx]).sum(dim=-1)
+        dist_norm = rel.norm(dim=-1)
+        score = proj - 0.2 * dist_norm
+        tips.append(verts[mask][torch.argmax(score)])
+    return torch.stack(tips, dim=0)
+
+
+def build_joint_centers(*, template, points_ordered: np.ndarray) -> dict[str, np.ndarray]:
+    index_to_offset = {int(index): offset for offset, index in enumerate(template.indexOrder)}
+    centers: dict[str, np.ndarray] = {}
+    for finger in FINGER_NAMES:
+        for level in JOINT_LEVELS:
+            pair_name = f"{finger}_{level}"
+            pair = template.jointPairMap[pair_name]
+            pos = points_ordered[index_to_offset[int(pair["pos"])]]
+            neg = points_ordered[index_to_offset[int(pair["neg"])]]
+            centers[pair_name] = 0.5 * (pos + neg)
+    return centers
+
+
+def build_mesh_joint_centers(*, mesh_joints: np.ndarray, mesh_tips: np.ndarray) -> dict[str, np.ndarray]:
+    centers: dict[str, np.ndarray] = {}
+    for finger_name, joint_ids in FINGER_JOINT_GROUPS.items():
+        for idx, joint_id in enumerate(joint_ids):
+            centers[f"{finger_name}_joint_{idx + 1}"] = mesh_joints[joint_id]
+        centers[f"{finger_name}_tip"] = mesh_tips[FINGER_NAMES.index(finger_name)]
+    return centers
+
+
+def build_ring_points(*, template, points_ordered: np.ndarray) -> dict[str, np.ndarray]:
+    index_to_offset = {int(index): offset for offset, index in enumerate(template.indexOrder)}
+    ring_points: dict[str, np.ndarray] = {}
+    for segment_name, ring_map in template.segmentRingMap.items():
+        ring_points[segment_name] = np.stack(
+            [
+                points_ordered[index_to_offset[int(ring_map["mid"])]],
+                points_ordered[index_to_offset[int(ring_map["pos"])]],
+                points_ordered[index_to_offset[int(ring_map["neg"])]],
+            ],
+            axis=0,
+        )
+    return ring_points
+
+
+def build_segment_axes(*, joint_centers: dict[str, np.ndarray]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    axes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for finger in FINGER_NAMES:
+        for seg_idx in range(1, 4):
+            proximal = joint_centers[f"{finger}_joint_{seg_idx}"]
+            distal = joint_centers[f"{finger}_tip"] if seg_idx == 3 else joint_centers[f"{finger}_joint_{seg_idx + 1}"]
+            axes[f"{finger}_segment_{seg_idx}"] = (proximal, distal)
+    return axes
+
+
+def segment_name_to_finger(segment_name: str) -> str:
+    for finger in FINGER_NAMES:
+        if segment_name.startswith(finger):
+            return finger
+    raise KeyError(f"unknown segment name: {segment_name}")
+
+
+def joint_name_to_finger(joint_name: str) -> str:
+    for finger in FINGER_NAMES:
+        if joint_name.startswith(finger):
+            return finger
+    raise KeyError(f"unknown joint name: {joint_name}")

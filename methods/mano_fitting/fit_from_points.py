@@ -31,6 +31,30 @@ from utils.mano.reorder import resolveApproxIkInputOrders
 from utils.mano.approx import ApproxForwardManoEstimator
 
 
+def _save_single_sample_result(
+    *,
+    output_dir: Path,
+    stem: str,
+    mano_params: torch.Tensor,
+    metrics: dict[str, float],
+    known_shape_tag: str,
+    glb_path: Path | None,
+) -> None:
+    np.save(str(output_dir / "mano_fitting_mano_params.npy"), mano_params[0].detach().cpu().numpy().astype(np.float32))
+    payload = {
+        "sample_name": stem,
+        "method": "mano_fitting",
+        "known_shape_source": known_shape_tag,
+        **metrics,
+    }
+    (output_dir / "mano_fitting_metrics.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    if glb_path is not None and glb_path.is_file():
+        glb_path.replace(output_dir / "mano_fitting_visualization.glb")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fit MANO from 100 semantic points")
     parser.add_argument("--input-path", type=str, required=True)
@@ -74,6 +98,7 @@ def main() -> None:
     if args.export_glb:
         glb_dir.mkdir(parents=True, exist_ok=True)
 
+    compact_result: dict[str, object] | None = None
     for stem in target_stems:
         sample_index = stems.index(stem)
         sample = extract_sample_payload(payload, sample_index, sample_count)
@@ -107,10 +132,10 @@ def main() -> None:
             sample_indices=sample_indices,
         )
         rows.append({"sample_stem": stem, "method": "mano_fitting", "known_shape_source": known_shape_tag, **metrics})
-        np.save(str(output_dir / f"{stem}_mano_fitting.npy"), mano_fitting.detach().cpu().numpy())
+        glb_path = glb_dir / f"{stem}_mano_fitting.glb" if args.export_glb else None
         if args.export_glb:
             export_hand_comparison_glb(
-                output_path=glb_dir / f"{stem}_mano_fitting.glb",
+                output_path=glb_path,
                 variant_name="mano_fitting",
                 mano_params=mano_fitting,
                 target_left_points=left_points,
@@ -118,6 +143,28 @@ def main() -> None:
                 mano_layer=mano_layer,
                 sample_indices=sample_indices,
             )
+        if len(target_stems) == 1:
+            compact_result = {
+                "stem": stem,
+                "mano_params": mano_fitting,
+                "metrics": metrics,
+                "known_shape_tag": known_shape_tag,
+                "glb_path": glb_path,
+            }
+
+    if len(target_stems) == 1 and compact_result is not None:
+        _save_single_sample_result(
+            output_dir=output_dir,
+            stem=str(compact_result["stem"]),
+            mano_params=compact_result["mano_params"],
+            metrics=compact_result["metrics"],
+            known_shape_tag=str(compact_result["known_shape_tag"]),
+            glb_path=compact_result["glb_path"],
+        )
+        if glb_dir.exists():
+            glb_dir.rmdir()
+        print(f"[OK] metrics: {output_dir / 'mano_fitting_metrics.json'}")
+        return
 
     csv_path = output_dir / "mano_fitting_metrics.csv"
     fieldnames = list(rows[0].keys())
